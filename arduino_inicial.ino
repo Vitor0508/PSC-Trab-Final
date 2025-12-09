@@ -31,7 +31,7 @@
 // Configuração
 #define DHTTYPE DHT22
 DHT dht(PIN_SENSOR_DHT, DHTTYPE);
-LiquidCrystal_I2C lcd(0x27, 16, 2); 
+LiquidCrystal_I2C lcd(0x27, 24, 4); 
 
 // --- VARIÁVEIS DO SISTEMA ---
 bool sistemaAtivo = false;      
@@ -57,14 +57,17 @@ int ultimoModo = 0; // 0=Desligado, 1=Resfriando, 2=Aquecendo
 void setup() {
   Serial.begin(9600);
   
-  pinMode(PIN_BTN_START, INPUT_PULLUP);
-  pinMode(PIN_CHAVE_SELETORA, INPUT_PULLUP);
-  pinMode(PIN_CHAVE_EMERG, INPUT_PULLUP);
+  pinMode(PIN_BTN_START, INPUT);
+  pinMode(PIN_CHAVE_SELETORA, INPUT);
+  pinMode(PIN_CHAVE_EMERG, INPUT);
   
   pinMode(PIN_RELE_PELTIER_A, OUTPUT);
   pinMode(PIN_RELE_PELTIER_B, OUTPUT);
   pinMode(PIN_RELE_UMIDADE, OUTPUT);
   
+  digitalWrite(PIN_RELE_PELTIER_A, HIGH);
+  digitalWrite(PIN_RELE_PELTIER_B, HIGH);
+  digitalWrite(PIN_RELE_UMIDADE, LOW);
   // Desliga tudo inicialmente
   pararTudo();
 
@@ -217,7 +220,7 @@ void pararTudo() {
   // Estado de desligado seguro
   digitalWrite(PIN_RELE_PELTIER_A, HIGH); // Módulos relé geralmente desligam em HIGH
   digitalWrite(PIN_RELE_PELTIER_B, HIGH);
-  digitalWrite(PIN_RELE_UMIDADE, HIGH);
+  digitalWrite(PIN_RELE_UMIDADE, LOW); // Ventilador fica ligado para nao passar umidade
 }
 
 // --- FUNÇÕES DE VISUALIZAÇÃO ---
