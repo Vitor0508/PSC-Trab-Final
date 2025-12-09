@@ -49,6 +49,11 @@ float setpointHum = 60.0;  // Umidade alvo
 float histereseTemp = 1.0; // Evita oscilação térmica
 float histereseHum = 3.0;  
 
+// --- VARIÁVEIS DE PROTEÇÃO ---
+unsigned long ultimoTempoDesligado = 0;  // Marca a hora que o Peltier desligou
+const unsigned long tempoSeguranca = 60000; // 60 segundos (1 minuto) de espera obrigatória
+int ultimoModo = 0; // 0=Desligado, 1=Resfriando, 2=Aquecendo
+
 void setup() {
   Serial.begin(9600);
   
@@ -142,25 +147,59 @@ void loop() {
 // --- FUNÇÕES DE CONTROLE ---
 
 void controlarTemperatura(float temp) {
-  // Configuração para RESFRIAR (Padrão)
-  // Relé A = LOW (GND), Relé B = HIGH (12V) -> (Exemplo, depende da fiação)
+  unsigned long agora = millis();
   
-  // Se Temp > Alvo + Margem -> LIGA RESFRIAMENTO
+  // Definição do que o sistema QUER fazer agora
+  int acaoDesejada = 0; // 0 = Ficar desligado (zona morta)
+  
   if (temp > (setpointTemp + histereseTemp)) {
-    // Modo Frio
+    acaoDesejada = 1; // Precisa RESFRIAR
+  } 
+  else if (temp < (setpointTemp - histereseTemp)) {
+    acaoDesejada = 2; // Precisa AQUECER
+  }
+
+  // --- LÓGICA DE PROTEÇÃO ---
+  
+  // Se a ação desejada é igual ao que já está acontecendo, mantém.
+  if (acaoDesejada == ultimoModo) {
+    return; 
+  }
+
+  // Se queremos LIGAR algo (seja aquecer ou esfriar), verificamos o timer
+  if (acaoDesejada != 0) {
+    // Se passou pouco tempo desde que desligou, NÃO FAZ NADA (proteção)
+    if (agora - ultimoTempoDesligado < tempoSeguranca) {
+      // Opcional: Mostrar no Serial que está aguardando proteção
+      Serial.println("Aguardando tempo de segurança do Peltier...");
+      return; 
+    }
+    
+    // Proteção extra: Se estava esfriando e quer aquecer (inversão direta), 
+    // forçamos um desligamento primeiro se não tiver passado pelo estado 0.
+    // Mas como a lógica acima exige passar pela histerese, naturalmente ele desliga antes.
+  }
+
+  // --- EXECUÇÃO ---
+
+  if (acaoDesejada == 1) { // Ligar RESFRIAMENTO
     digitalWrite(PIN_RELE_PELTIER_A, HIGH); 
     digitalWrite(PIN_RELE_PELTIER_B, LOW);
-  } 
-  // Se Temp < Alvo - Margem -> LIGA AQUECIMENTO (Inverte Polaridade)
-  else if (temp < (setpointTemp - histereseTemp)) {
-    // Modo Quente (Invertido)
+    ultimoModo = 1;
+  }
+  else if (acaoDesejada == 2) { // Ligar AQUECIMENTO
     digitalWrite(PIN_RELE_PELTIER_A, LOW);
     digitalWrite(PIN_RELE_PELTIER_B, HIGH);
-  } 
-  // Se estiver dentro da margem ideal -> DESLIGA TUDO
-  else {
-    digitalWrite(PIN_RELE_PELTIER_A, HIGH); // Ambos HIGH ou Ambos LOW desligam
+    ultimoModo = 2;
+  }
+  else { // DESLIGAR TUDO (acaoDesejada == 0)
+    // Só atualizamos o timer se ele ESTAVA ligado antes
+    if (ultimoModo != 0) {
+      ultimoTempoDesligado = agora;
+    }
+    digitalWrite(PIN_RELE_PELTIER_A, HIGH); 
     digitalWrite(PIN_RELE_PELTIER_B, HIGH);
+    ultimoModo = 0;
   }
 }
 
