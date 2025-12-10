@@ -1,6 +1,6 @@
 /*
  * PROJETO: Controle Peltier (Quente/Frio) + Umidade
- * VERSAO: Final Ajustada (Range 0-70C + Decimais Corrigidos)
+ * VERSAO: Correção Botão Stop/Emergência (Umidade Travada)
  */
 
 #include <Wire.h>
@@ -8,15 +8,15 @@
 #include <DHT.h>
 
 // --- DEFINIÇÃO DE PINOS ---
-#define PIN_POT A0           
+#define PIN_POT A0            
 #define PIN_BTN_START 4      
 #define PIN_CHAVE_SELETORA 3 
 #define PIN_CHAVE_EMERG 2    
-#define PIN_SENSOR_DHT 5     
+#define PIN_SENSOR_DHT 5      
 
 #define PIN_RELE_PELTIER_A 7 
 #define PIN_RELE_PELTIER_B 8 
-#define PIN_RELE_UMIDADE 9   
+#define PIN_RELE_UMIDADE 9    
 
 // --- AJUSTE DE LÓGICA DOS RELÉS ---
 #define RELE_LIGADO LOW
@@ -25,11 +25,10 @@
 // Configuração
 #define DHTTYPE DHT22
 DHT dht(PIN_SENSOR_DHT, DHTTYPE);
-// Verifique se seu LCD é 20x4 ou 16x2. O código abaixo assume 20 colunas.
 LiquidCrystal_I2C lcd(0x27, 20, 4); 
 
 // --- VARIÁVEIS DO SISTEMA ---
-bool sistemaAtivo = false;      
+bool sistemaAtivo = false;       
 bool emEmergencia = false;
 bool ultimoEstadoBtnStart = HIGH; 
 unsigned long lastDebounceTime = 0;
@@ -62,9 +61,9 @@ void setup() {
   // Garante que comece tudo desligado
   digitalWrite(PIN_RELE_PELTIER_A, RELE_DESLIGADO);
   digitalWrite(PIN_RELE_PELTIER_B, RELE_DESLIGADO);
-  digitalWrite(PIN_RELE_UMIDADE, RELE_DESLIGADO);
+  digitalWrite(PIN_RELE_UMIDADE, LOW);
   
-  // Inicializa o timer (permite ligar imediatamente na primeira vez)
+  // Timer inicial para permitir ligar logo
   ultimoTempoDesligado = millis() - tempoSeguranca; 
 
   dht.begin();
@@ -82,7 +81,7 @@ void loop() {
       emEmergencia = true;
       sistemaAtivo = false;
     }
-    pararTudo(); 
+    pararTudo(); // Chama a função que agora força o desligamento de tudo
     lcd.setCursor(0,0); lcd.print("!! EMERGENCIA !!");
     lcd.setCursor(0,1); lcd.print("SISTEMA TRAVADO ");
     delay(100);
@@ -123,11 +122,11 @@ void loop() {
   int valorPot = analogRead(PIN_POT);
   bool ajustandoTemp = (digitalRead(PIN_CHAVE_SELETORA) == HIGH);
   
-  // --- ALTERAÇÃO SOLICITADA 1: Range de 0 a 70 ---
+  // Range ajustado
   if (ajustandoTemp) {
-     setpointTemp = map(valorPot, 0, 1023, 0, 70); 
+      setpointTemp = map(valorPot, 0, 1023, 0, 70); 
   } else {
-     setpointHum = map(valorPot, 0, 1023, 0, 100);
+      setpointHum = map(valorPot, 0, 1023, 0, 100);
   }
 
   // 4. LÓGICA DE CONTROLE
@@ -135,7 +134,11 @@ void loop() {
     controlarTemperatura(tempAtual);
     controlarUmidade(humAtual);
   } else {
-    if(ultimoModo != 0) pararTudo(); 
+    // --- CORREÇÃO AQUI ---
+    // Removemos o "if(ultimoModo != 0)". 
+    // Se o sistema não está ativo, TEM que chamar pararTudo() para garantir 
+    // que a umidade e os peltiers fiquem desligados.
+    pararTudo(); 
   }
 
   // 5. ATUALIZAÇÃO VISUAL
@@ -161,7 +164,6 @@ void controlarTemperatura(float temp) {
     }
   }
 
-  // Lógica Invertida (conforme pedido anterior)
   if (acaoDesejada == 1) { 
     // MODO RESFRIAR
     digitalWrite(PIN_RELE_PELTIER_A, RELE_DESLIGADO); 
@@ -180,25 +182,34 @@ void controlarTemperatura(float temp) {
 }
 
 void controlarUmidade(float hum) {
-  if (hum < (setpointHum - histereseHum)) {
-    digitalWrite(PIN_RELE_UMIDADE, RELE_LIGADO); 
+  // Só atua se o sistema estiver ativo (redundância de segurança)
+  if (!sistemaAtivo) {
+      digitalWrite(PIN_RELE_UMIDADE, LOW);
+      return;
+  }
+
+  if (hum > (setpointHum - histereseHum)) {
+    digitalWrite(PIN_RELE_UMIDADE, HIGH); 
   } 
-  else if (hum > setpointHum) {
-    digitalWrite(PIN_RELE_UMIDADE, RELE_DESLIGADO); 
+  else if (hum < setpointHum) {
+    digitalWrite(PIN_RELE_UMIDADE, LOW); 
   }
 }
 
 void pararTudo() {
   unsigned long agora = millis();
   
+  // Só mexe no timer do Peltier se o Peltier estava ligado.
+  // Isso evita reiniciar o timer se só a umidade estava ligada.
   if (ultimoModo != 0) {
     ultimoTempoDesligado = agora;
     ultimoModo = 0;
   }
 
+  // --- FORÇA BRUTA: Desliga tudo incondicionalmente ---
   digitalWrite(PIN_RELE_PELTIER_A, RELE_DESLIGADO);
   digitalWrite(PIN_RELE_PELTIER_B, RELE_DESLIGADO);
-  digitalWrite(PIN_RELE_UMIDADE, RELE_DESLIGADO); 
+  digitalWrite(PIN_RELE_UMIDADE, LOW); 
 }
 
 // --- VISUALIZAÇÃO ---
@@ -212,7 +223,7 @@ void atualizarLCD(float t, float h, bool modoTemp) {
   lcd.setCursor(0, 0);
   if (sistemaAtivo) lcd.print("ON "); else lcd.print("OFF");
   
-  // --- ALTERAÇÃO SOLICITADA 2: Remover Decimais (,0) ---
+  // Sem decimais
   lcd.print(" T:"); lcd.print(t, 0); lcd.print("C U:"); lcd.print(h, 0); lcd.print("%");
 
   // Linha 2: Info / Timer
@@ -225,17 +236,15 @@ void atualizarLCD(float t, float h, bool modoTemp) {
   bool bloqueado = (tempoPassado < tempoSeguranca);
 
   if (sistemaAtivo && bloqueado && precisaAtuar) {
-    // Texto ajustado para caber em 20 colunas
     lcd.print("AGUARDE PROTECAO: "); 
     if(segundosRestantes < 10) lcd.print("0");
     lcd.print(segundosRestantes);
-    lcd.print("s   "); 
+    lcd.print("s    "); 
   } 
   else if (sistemaAtivo && !bloqueado && precisaAtuar && ultimoModo == 0) {
      lcd.print("PREPARANDO...       ");
   }
   else {
-    // --- ALTERAÇÃO SOLICITADA 2 (Continuação): Remover Decimais dos Setpoints ---
     if (modoTemp) {
       lcd.print("SetT:>"); lcd.print(setpointTemp, 0); lcd.print(" SetU: "); lcd.print(setpointHum, 0);
     } else {
@@ -247,7 +256,7 @@ void atualizarLCD(float t, float h, bool modoTemp) {
 void enviarSerial(float t, float h) {
   if (millis() - delaySerial > 1000) {
     Serial.print("Modo: "); Serial.print(ultimoModo);
-    Serial.print(" | T: "); Serial.print(t, 1); // Serial mantive com 1 casa decimal para precisão
+    Serial.print(" | T: "); Serial.print(t, 1);
     Serial.print(" | U: "); Serial.println(h, 1);
     delaySerial = millis();
   }
