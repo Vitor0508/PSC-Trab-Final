@@ -1,6 +1,6 @@
 /*
  * PROJETO: Controle Peltier (Quente/Frio) + Umidade
- * VERSAO: Correção Botão Stop/Emergência (Umidade Travada)
+ * VERSAO: Soft Pickup (Correção do Pulo do Potenciômetro)
  */
 
 #include <Wire.h>
@@ -9,7 +9,7 @@
 
 // --- DEFINIÇÃO DE PINOS ---
 #define PIN_POT A0            
-#define PIN_BTN_START 4      
+#define PIN_BTN_START 4       
 #define PIN_CHAVE_SELETORA 3 
 #define PIN_CHAVE_EMERG 2    
 #define PIN_SENSOR_DHT 5      
@@ -47,6 +47,10 @@ unsigned long ultimoTempoDesligado = 0;
 const unsigned long tempoSeguranca = 60000; // 60s
 int ultimoModo = 0; // 0=Desligado, 1=Resfriando, 2=Aquecendo
 
+// --- VARIÁVEIS PARA LOGICA DO POTENCIOMETRO (NOVO) ---
+int ultimoEstadoChave = -1; // Para detectar troca da chave
+bool modoSincronia = false; // Indica se o pot está travado esperando encontro
+
 void setup() {
   Serial.begin(9600);
   
@@ -70,6 +74,9 @@ void setup() {
   lcd.init();
   lcd.backlight();
   
+  // Inicializa estado da chave
+  ultimoEstadoChave = digitalRead(PIN_CHAVE_SELETORA);
+
   Serial.println("--- INICIANDO SISTEMA ---");
 }
 
@@ -81,7 +88,7 @@ void loop() {
       emEmergencia = true;
       sistemaAtivo = false;
     }
-    pararTudo(); // Chama a função que agora força o desligamento de tudo
+    pararTudo(); 
     lcd.setCursor(0,0); lcd.print("!! EMERGENCIA !!");
     lcd.setCursor(0,1); lcd.print("SISTEMA TRAVADO ");
     delay(100);
@@ -109,7 +116,7 @@ void loop() {
   }
   ultimoEstadoBtnStart = leituraBtn;
 
-  // 3. LEITURA SENSOR/POT
+  // 3. LEITURA SENSOR E POTENCIÔMETRO (LÓGICA CORRIGIDA)
   float tempAtual = dht.readTemperature();
   float humAtual = dht.readHumidity();
 
@@ -119,30 +126,55 @@ void loop() {
     return;
   }
 
+  // --- LÓGICA SOFT PICKUP ---
+  int leituraChave = digitalRead(PIN_CHAVE_SELETORA);
+  bool ajustandoTemp = (leituraChave == HIGH);
   int valorPot = analogRead(PIN_POT);
-  bool ajustandoTemp = (digitalRead(PIN_CHAVE_SELETORA) == HIGH);
   
-  // Range ajustado
-  if (ajustandoTemp) {
-      setpointTemp = map(valorPot, 0, 1023, 0, 70); 
-  } else {
-      setpointHum = map(valorPot, 0, 1023, 0, 100);
+  // Detecta se o usuário trocou a chave de posição
+  if (leituraChave != ultimoEstadoChave) {
+      modoSincronia = true; // Ativa a trava de segurança
+      ultimoEstadoChave = leituraChave;
+      lcd.clear(); // Limpa para mostrar msg de trava
   }
+
+  // Calcula quanto o potenciômetro valeria se estivesse ativo agora
+  float valorPotMapeado;
+  if (ajustandoTemp) {
+      valorPotMapeado = map(valorPot, 0, 1023, 0, 70); 
+  } else {
+      valorPotMapeado = map(valorPot, 0, 1023, 0, 100);
+  }
+
+  // Se estiver em modo de sincronia, verifica se o pot "encontrou" o valor salvo
+  if (modoSincronia) {
+      float valorAlvo = ajustandoTemp ? setpointTemp : setpointHum;
+      // Tolerância de +/- 2 unidades para destravar
+      if (abs(valorPotMapeado - valorAlvo) < 2.0) {
+          modoSincronia = false; // Destrava! O pot alcançou o valor.
+      }
+      // Se não encontrou, NÃO atualiza os setpoints (mantém o valor antigo)
+  } else {
+      // Se não está travado, atualiza normalmente
+      if (ajustandoTemp) {
+          setpointTemp = valorPotMapeado;
+      } else {
+          setpointHum = valorPotMapeado;
+      }
+  }
+  // --------------------------
 
   // 4. LÓGICA DE CONTROLE
   if (sistemaAtivo) {
     controlarTemperatura(tempAtual);
     controlarUmidade(humAtual);
   } else {
-    // --- CORREÇÃO AQUI ---
-    // Removemos o "if(ultimoModo != 0)". 
-    // Se o sistema não está ativo, TEM que chamar pararTudo() para garantir 
-    // que a umidade e os peltiers fiquem desligados.
     pararTudo(); 
   }
 
   // 5. ATUALIZAÇÃO VISUAL
-  atualizarLCD(tempAtual, humAtual, ajustandoTemp);
+  // Passo também o valorPotMapeado para mostrar na tela o "Fantasma" durante a trava
+  atualizarLCD(tempAtual, humAtual, ajustandoTemp, valorPotMapeado);
   enviarSerial(tempAtual, humAtual);
 }
 
@@ -182,7 +214,6 @@ void controlarTemperatura(float temp) {
 }
 
 void controlarUmidade(float hum) {
-  // Só atua se o sistema estiver ativo (redundância de segurança)
   if (!sistemaAtivo) {
       digitalWrite(PIN_RELE_UMIDADE, LOW);
       return;
@@ -199,34 +230,44 @@ void controlarUmidade(float hum) {
 void pararTudo() {
   unsigned long agora = millis();
   
-  // Só mexe no timer do Peltier se o Peltier estava ligado.
-  // Isso evita reiniciar o timer se só a umidade estava ligada.
   if (ultimoModo != 0) {
     ultimoTempoDesligado = agora;
     ultimoModo = 0;
   }
 
-  // --- FORÇA BRUTA: Desliga tudo incondicionalmente ---
   digitalWrite(PIN_RELE_PELTIER_A, RELE_DESLIGADO);
   digitalWrite(PIN_RELE_PELTIER_B, RELE_DESLIGADO);
   digitalWrite(PIN_RELE_UMIDADE, LOW); 
 }
 
-// --- VISUALIZAÇÃO ---
+// --- VISUALIZAÇÃO ATUALIZADA ---
 
-void atualizarLCD(float t, float h, bool modoTemp) {
+void atualizarLCD(float t, float h, bool modoTemp, float potFantasma) {
   static unsigned long lcdTimer = 0;
-  if (millis() - lcdTimer < 300) return;
+  if (millis() - lcdTimer < 250) return; // Atualização um pouco mais rápida
   lcdTimer = millis();
 
-  // Linha 1: Status
+  // Se estiver em modo sincronia, mostra interface de ajuda
+  if (modoSincronia) {
+      lcd.setCursor(0, 0);
+      lcd.print(">> TRAVA DE SEGUR <<");
+      lcd.setCursor(0, 1);
+      // Mostra o valor que você está tentando alcançar e onde o pot está
+      lcd.print("Gire p/ "); 
+      if(modoTemp) lcd.print(setpointTemp, 0); else lcd.print(setpointHum, 0);
+      
+      lcd.print(" (Pot:"); 
+      lcd.print(potFantasma, 0); 
+      lcd.print(")");
+      return; // Sai da função, não mostra o padrão
+  }
+
+  // --- INTERFACE PADRÃO ---
   lcd.setCursor(0, 0);
   if (sistemaAtivo) lcd.print("ON "); else lcd.print("OFF");
   
-  // Sem decimais
   lcd.print(" T:"); lcd.print(t, 0); lcd.print("C U:"); lcd.print(h, 0); lcd.print("%");
 
-  // Linha 2: Info / Timer
   lcd.setCursor(0, 1);
   
   long tempoPassado = millis() - ultimoTempoDesligado;
@@ -236,15 +277,13 @@ void atualizarLCD(float t, float h, bool modoTemp) {
   bool bloqueado = (tempoPassado < tempoSeguranca);
 
   if (sistemaAtivo && bloqueado && precisaAtuar) {
-    lcd.print("AGUARDE PROTECAO: "); 
+    lcd.print("AGUARDE PROT: "); 
     if(segundosRestantes < 10) lcd.print("0");
     lcd.print(segundosRestantes);
-    lcd.print("s    "); 
+    lcd.print("s   "); 
   } 
-  else if (sistemaAtivo && !bloqueado && precisaAtuar && ultimoModo == 0) {
-     lcd.print("PREPARANDO...       ");
-  }
   else {
+    // Mostra setas indicando qual está sendo editado
     if (modoTemp) {
       lcd.print("SetT:>"); lcd.print(setpointTemp, 0); lcd.print(" SetU: "); lcd.print(setpointHum, 0);
     } else {
