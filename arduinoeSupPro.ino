@@ -6,8 +6,9 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <DHT.h>
+#include <Modbusino.h>
 
-ModbusinoSlave modbusino_slave(1):
+ModbusinoSlave modbusino_slave(1);
 
 // --- DEFINIÇÃO DE PINOS ---
 #define PIN_POT A0            
