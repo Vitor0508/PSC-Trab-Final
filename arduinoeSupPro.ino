@@ -1,6 +1,6 @@
 /*
  * PROJETO: Controle Peltier Hibrido (SCADA + Fisico)
- * VERSAO: Travamento de Emergencia Unificado
+ * VERSAO: Correção LCD (Sem bloqueio visual na Sincronia)
  */
 
 #include <Wire.h>
@@ -30,7 +30,7 @@ LiquidCrystal_I2C lcd(0x27, 20, 4);
 
 // --- VARIÁVEIS DO SISTEMA ---
 bool sistemaAtivo = false;       
-bool emergenciaVirtual = false; // Novo: Controlado pelo SCADA
+bool emergenciaVirtual = false; 
 bool ultimoEstadoBtnStart = HIGH; 
 unsigned long lastDebounceTime = 0;
 
@@ -86,87 +86,65 @@ void setup() {
 
 void loop() {
   
-  // 1. LEITURA BÁSICA
+  // 1. LEITURA SENSOR
   float tempAtual = dht.readTemperature();
   float humAtual = dht.readHumidity();
   if (isnan(tempAtual)) tempAtual = 0.0;
   if (isnan(humAtual)) humAtual = 0.0;
 
-  // Atualiza Leituras Modbus
+  // Atualiza Modbus
   tab_reg[0] = (uint16_t)(tempAtual * 10);      
   tab_reg[1] = (uint16_t)(humAtual * 10);       
   
-  // Status Code para o SCADA:
-  // 0=Off, 1=Resfria, 2=Aquece, 3=Ligado(Standby), 4=EMERGENCIA
+  // Status Code (0=Off, 1=Resfria, 2=Aquece, 3=Standby, 4=EMERGENCIA)
   if (digitalRead(PIN_CHAVE_EMERG) == LOW || emergenciaVirtual) {
-      tab_reg[4] = 4; // Avisa o SCADA que está em Emergência
+      tab_reg[4] = 4; 
   } else {
       tab_reg[4] = (uint16_t)(sistemaAtivo ? (ultimoModo == 0 ? 3 : ultimoModo) : 0); 
   }
 
-  // --- MODBUS COMMS ---
   modbusino_slave.loop(tab_reg, 10);
 
-  // 2. PROCESSA COMANDOS SCADA (Antes de verificar emergência)
+  // 2. COMANDOS SCADA
   switch(tab_reg[5]) {
     case 1: // LIGAR
-      // Só aceita ligar se não houver NENHUMA emergência
       if (digitalRead(PIN_CHAVE_EMERG) == HIGH && !emergenciaVirtual) {
           sistemaAtivo = true;
       }
       tab_reg[5] = 0; 
       break;
-      
     case 2: // DESLIGAR
       sistemaAtivo = false;
       pararTudo();
       tab_reg[5] = 0;
       break;
-      
     case 3: // ACIONAR EMERGENCIA VIRTUAL
       emergenciaVirtual = true;
       tab_reg[5] = 0;
       break;
-      
     case 4: // RESETAR EMERGENCIA VIRTUAL
       emergenciaVirtual = false;
       tab_reg[5] = 0;
       break;
   }
 
-  // --- 3. VERIFICAÇÃO DE EMERGÊNCIA UNIFICADA ---
+  // 3. EMERGÊNCIA UNIFICADA
   bool emergenciaFisica = (digitalRead(PIN_CHAVE_EMERG) == LOW);
   
-  // Se QUALQUER um dos dois estiver acionado
   if (emergenciaFisica || emergenciaVirtual) {
+      sistemaAtivo = false; 
+      pararTudo();          
       
-      sistemaAtivo = false; // Derruba o sistema
-      pararTudo();          // Desliga relés
-      
-      // ROTINA DE DISPLAY DE TRAVAMENTO
-      lcd.setCursor(0,0); 
-      lcd.print("!! EMERGENCIA !!");
-      
+      lcd.setCursor(0,0); lcd.print("!! EMERGENCIA !!");
       lcd.setCursor(0,1);
-      // Informa ao operador qual é a trava ativa
-      if (emergenciaFisica && emergenciaVirtual) {
-         lcd.print("TRAVA: FIS + VIRT");
-      } else if (emergenciaFisica) {
-         lcd.print("TRAVA: FISICA    ");
-      } else {
-         lcd.print("TRAVA: SCADA     ");
-      }
+      if (emergenciaFisica && emergenciaVirtual) lcd.print("TRAVA: FIS + VIRT");
+      else if (emergenciaFisica) lcd.print("TRAVA: FISICA    ");
+      else lcd.print("TRAVA: SCADA     ");
 
-      // IMPORTANTE: O return aqui impede que o código abaixo seja executado.
-      // Ou seja: botões físicos de start, setpoints, PID... tudo é ignorado.
       return; 
   }
 
-  // ==========================================================
-  // DAQUI PRA BAIXO O CÓDIGO SÓ RODA SE ESTIVER TUDO SEGURO
-  // ==========================================================
-
-  // 4. BOTÃO START FÍSICO (Agora só funciona se não houver emergência)
+  // 4. BOTÃO START FÍSICO
   int leituraBtn = digitalRead(PIN_BTN_START);
   if (leituraBtn == LOW && ultimoEstadoBtnStart == HIGH && (millis() - lastDebounceTime) > 200) {
     sistemaAtivo = !sistemaAtivo;
@@ -182,11 +160,11 @@ void loop() {
     return;
   }
 
-  // 5. LÓGICA DE SETPOINT HÍBRIDO
+  // 5. SETPOINT HÍBRIDO
   float scadaTemp = (float)tab_reg[2] / 10.0;
   float scadaHum = (float)tab_reg[3] / 10.0;
 
-  // Verifica Mudança SCADA
+  // SCADA vence
   if (abs(scadaTemp - setpointTemp) > 0.1) {
       setpointTemp = scadaTemp;
       modoSincronia = true; 
@@ -196,7 +174,7 @@ void loop() {
       modoSincronia = true;
   }
 
-  // Verifica Mudança Potenciômetro
+  // Potenciômetro
   int leituraChave = digitalRead(PIN_CHAVE_SELETORA);
   bool ajustandoTemp = (leituraChave == HIGH);
   int valorPot = analogRead(PIN_POT);
@@ -226,6 +204,7 @@ void loop() {
           }
       }
   } else {
+      // Mantém SCADA sincronizado com a lógica interna
       tab_reg[2] = (uint16_t)(setpointTemp * 10);
       tab_reg[3] = (uint16_t)(setpointHum * 10);
   }
@@ -238,7 +217,8 @@ void loop() {
     pararTudo(); 
   }
 
-  atualizarLCD(tempAtual, humAtual, ajustandoTemp, map(valorPot, 0, 1023, ajustandoTemp?70:100, 0));
+  // Chamada do LCD atualizada
+  atualizarLCD(tempAtual, humAtual, ajustandoTemp);
 }
 
 // --- FUNÇÕES AUXILIARES ---
@@ -284,25 +264,32 @@ void pararTudo() {
   digitalWrite(PIN_RELE_UMIDADE, LOW); 
 }
 
-void atualizarLCD(float t, float h, bool modoTemp, float potFantasma) {
+// --- VISUALIZAÇÃO CORRIGIDA ---
+void atualizarLCD(float t, float h, bool modoTemp) {
   static unsigned long lcdTimer = 0;
   if (millis() - lcdTimer < 250) return; 
   lcdTimer = millis();
 
-  if (modoSincronia) {
-      lcd.setCursor(0, 0); lcd.print(">> SINCRONIA << ");
-      lcd.setCursor(0, 1); lcd.print("Gire Pot -> Alvo");
-      return; 
-  }
+  // Removi o bloco "if (modoSincronia) return" que bloqueava a tela
 
+  // LINHA 0: Status e Leituras
   lcd.setCursor(0, 0);
   if (sistemaAtivo) lcd.print("ON  "); else lcd.print("OFF ");
   lcd.print("T:"); lcd.print(t, 0); lcd.print(" U:"); lcd.print(h, 0); 
 
+  // LINHA 1: Setpoints e Indicador de Modo
   lcd.setCursor(0, 1);
+  
+  // Define o caractere indicador:
+  // '>' = Potenciômetro Ativo
+  // '*' = Sincronia Pendente (Valor do SCADA prevalece, Pot travado)
+  char indicador = modoSincronia ? '*' : '>';
+
   if (modoTemp) {
-     lcd.print("SetT:>"); lcd.print(setpointTemp, 0); lcd.print(" SetU: "); lcd.print(setpointHum, 0);
+     lcd.print("SetT:"); lcd.print(indicador); lcd.print(setpointTemp, 0); 
+     lcd.print(" SetU: "); lcd.print(setpointHum, 0);
   } else {
-     lcd.print("SetT: "); lcd.print(setpointTemp, 0); lcd.print(" SetU:>"); lcd.print(setpointHum, 0);
+     lcd.print("SetT: "); lcd.print(setpointTemp, 0); 
+     lcd.print(" SetU:"); lcd.print(indicador); lcd.print(setpointHum, 0);
   }
 }
