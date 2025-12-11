@@ -1,6 +1,6 @@
 /*
  * PROJETO: Controle Peltier Hibrido (SCADA + Fisico)
- * VERSAO: Correção LCD (Sem bloqueio visual na Sincronia)
+ * VERSAO: Com Feedback do Rele de Umidade (Reg 6)
  */
 
 #include <Wire.h>
@@ -92,7 +92,7 @@ void loop() {
   if (isnan(tempAtual)) tempAtual = 0.0;
   if (isnan(humAtual)) humAtual = 0.0;
 
-  // Atualiza Modbus
+  // --- ATUALIZAÇÃO MODBUS ---
   tab_reg[0] = (uint16_t)(tempAtual * 10);      
   tab_reg[1] = (uint16_t)(humAtual * 10);       
   
@@ -102,6 +102,10 @@ void loop() {
   } else {
       tab_reg[4] = (uint16_t)(sistemaAtivo ? (ultimoModo == 0 ? 3 : ultimoModo) : 0); 
   }
+
+  // --- NOVO: STATUS DO RELÉ DE UMIDADE ---
+  // Lê o estado físico do pino 9. Se HIGH retorna 1, se LOW retorna 0.
+  tab_reg[6] = digitalRead(PIN_RELE_UMIDADE); 
 
   modbusino_slave.loop(tab_reg, 10);
 
@@ -204,7 +208,6 @@ void loop() {
           }
       }
   } else {
-      // Mantém SCADA sincronizado com a lógica interna
       tab_reg[2] = (uint16_t)(setpointTemp * 10);
       tab_reg[3] = (uint16_t)(setpointHum * 10);
   }
@@ -217,7 +220,6 @@ void loop() {
     pararTudo(); 
   }
 
-  // Chamada do LCD atualizada
   atualizarLCD(tempAtual, humAtual, ajustandoTemp);
 }
 
@@ -249,6 +251,13 @@ void controlarTemperatura(float temp) {
 
 void controlarUmidade(float hum) {
   if (!sistemaAtivo) { digitalWrite(PIN_RELE_UMIDADE, LOW); return; }
+  
+  // LOGICA: Se Umidade Atual > Setpoint, LIGA o umidificador?
+  // Normalmente, se for UMIDIFICADOR: Se Hum < Setpoint, LIGA.
+  // Se for EXAUSTOR/DESUMIDIFICADOR: Se Hum > Setpoint, LIGA.
+  // Pelo seu código original: hum > (set - hist) -> LIGA (HIGH).
+  // Isso indica um comportamento de DESUMIDIFICAR ou ventilar.
+  
   if (hum > (setpointHum - histereseHum)) digitalWrite(PIN_RELE_UMIDADE, HIGH); 
   else if (hum < setpointHum) digitalWrite(PIN_RELE_UMIDADE, LOW); 
 }
@@ -264,25 +273,16 @@ void pararTudo() {
   digitalWrite(PIN_RELE_UMIDADE, LOW); 
 }
 
-// --- VISUALIZAÇÃO CORRIGIDA ---
 void atualizarLCD(float t, float h, bool modoTemp) {
   static unsigned long lcdTimer = 0;
   if (millis() - lcdTimer < 250) return; 
   lcdTimer = millis();
 
-  // Removi o bloco "if (modoSincronia) return" que bloqueava a tela
-
-  // LINHA 0: Status e Leituras
   lcd.setCursor(0, 0);
   if (sistemaAtivo) lcd.print("ON  "); else lcd.print("OFF ");
   lcd.print("T:"); lcd.print(t, 0); lcd.print(" U:"); lcd.print(h, 0); 
 
-  // LINHA 1: Setpoints e Indicador de Modo
   lcd.setCursor(0, 1);
-  
-  // Define o caractere indicador:
-  // '>' = Potenciômetro Ativo
-  // '*' = Sincronia Pendente (Valor do SCADA prevalece, Pot travado)
   char indicador = modoSincronia ? '*' : '>';
 
   if (modoTemp) {
