@@ -122,6 +122,9 @@ void loop() {
          emEmergencia = true;
          sistemaAtivo = false;
          pararTudo();
+         lcd.setCursor(0,0); lcd.print("!! EMERGENCIA !!");
+         lcd.setCursor(0,1); lcd.print("SISTEMA TRAVADO ");
+         delay(100);
       }
       tab_reg[5] = 0;
       break;
