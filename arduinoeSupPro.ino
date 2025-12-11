@@ -1,6 +1,6 @@
 /*
- * PROJETO: Controle Peltier (Quente/Frio) + Umidade + SCADA (MODBUS)
- * VERSAO: Clean Serial (Sem conflito de porta)
+ * PROJETO: Controle Peltier Hibrido (SCADA + Fisico)
+ * VERSAO: Correção LCD (Sem bloqueio visual na Sincronia)
  */
 
 #include <Wire.h>
@@ -8,7 +8,6 @@
 #include <DHT.h>
 #include <Modbusino.h>
 
-// ID do escravo Modbus = 1
 ModbusinoSlave modbusino_slave(1);
 
 // --- DEFINIÇÃO DE PINOS ---
@@ -22,18 +21,16 @@ ModbusinoSlave modbusino_slave(1);
 #define PIN_RELE_PELTIER_B 8 
 #define PIN_RELE_UMIDADE 9    
 
-// --- AJUSTE DE LÓGICA DOS RELÉS ---
 #define RELE_LIGADO LOW
 #define RELE_DESLIGADO HIGH
 
-// Configuração
 #define DHTTYPE DHT22
 DHT dht(PIN_SENSOR_DHT, DHTTYPE);
 LiquidCrystal_I2C lcd(0x27, 20, 4); 
 
 // --- VARIÁVEIS DO SISTEMA ---
 bool sistemaAtivo = false;       
-bool emEmergencia = false;
+bool emergenciaVirtual = false; 
 bool ultimoEstadoBtnStart = HIGH; 
 unsigned long lastDebounceTime = 0;
 
@@ -45,20 +42,21 @@ float setpointHum = 60.0;
 float histereseTemp = 1.0; 
 float histereseHum = 3.0;  
 
-// --- VARIÁVEIS DE PROTEÇÃO ---
+// Proteção
 unsigned long ultimoTempoDesligado = 0;  
-const unsigned long tempoSeguranca = 60000; // 60s
-int ultimoModo = 0; // 0=Desligado, 1=Resfriando, 2=Aquecendo
+const unsigned long tempoSeguranca = 60000; 
+int ultimoModo = 0; 
 
-// --- VARIÁVEIS PARA LOGICA DO POTENCIOMETRO ---
+// Híbrido SCADA/POT
 int ultimoEstadoChave = -1; 
 bool modoSincronia = false; 
+int ultimaLeituraPot = 0; 
+const int limiarMovimento = 15; 
 
-// Tabela Modbus (10 registradores)
+// Tabela Modbus [0..9]
 uint16_t tab_reg[10];
 
 void setup() {
-  // Configura a Serial para Modbus (9600 baud)
   modbusino_slave.setup(9600);
   
   pinMode(PIN_BTN_START, INPUT_PULLUP);
@@ -69,22 +67,21 @@ void setup() {
   pinMode(PIN_RELE_PELTIER_B, OUTPUT);
   pinMode(PIN_RELE_UMIDADE, OUTPUT);
   
-  // Garante que comece tudo desligado
   digitalWrite(PIN_RELE_PELTIER_A, RELE_DESLIGADO);
   digitalWrite(PIN_RELE_PELTIER_B, RELE_DESLIGADO);
   digitalWrite(PIN_RELE_UMIDADE, LOW);
   
-  // Timer inicial para permitir ligar logo
   ultimoTempoDesligado = millis() - tempoSeguranca; 
 
   dht.begin();
   lcd.init();
   lcd.backlight();
   
-  // Inicializa estado da chave
   ultimoEstadoChave = digitalRead(PIN_CHAVE_SELETORA);
-
-  // Serial.println("--- INICIANDO SISTEMA ---"); // COMENTADO: CONFLITO MODBUS
+  ultimaLeituraPot = analogRead(PIN_POT); 
+  
+  tab_reg[2] = (uint16_t)(setpointTemp * 10);
+  tab_reg[3] = (uint16_t)(setpointHum * 10);
 }
 
 void loop() {
@@ -92,65 +89,92 @@ void loop() {
   // 1. LEITURA SENSOR
   float tempAtual = dht.readTemperature();
   float humAtual = dht.readHumidity();
-
-  // Se der erro no sensor, zera valores para segurança
   if (isnan(tempAtual)) tempAtual = 0.0;
   if (isnan(humAtual)) humAtual = 0.0;
 
-  // --- ATUALIZAÇÃO TABELA MODBUS (SCADA) ---
-  // Multiplicamos por 10 para enviar decimais como inteiro (Ex: 25.5 vira 255)
-  tab_reg[0] = (uint16_t)(tempAtual * 10);      // Temp Real
-  tab_reg[1] = (uint16_t)(humAtual * 10);       // Umid Real
-  tab_reg[2] = (uint16_t)(setpointTemp * 10);   // Setpoint T
-  tab_reg[3] = (uint16_t)(setpointHum * 10);    // Setpoint U
-  tab_reg[4] = (uint16_t)ultimoModo;            // Status (0, 1 ou 2)
+  // Atualiza Modbus
+  tab_reg[0] = (uint16_t)(tempAtual * 10);      
+  tab_reg[1] = (uint16_t)(humAtual * 10);       
   
-  // Processa requisições do Elipse
-  modbusino_slave.loop(tab_reg, 10);
-
-  // 2. VERIFICA EMERGÊNCIA
-  if (digitalRead(PIN_CHAVE_EMERG) == LOW) { 
-    if (!emEmergencia) {
-      // Serial.println("!!! PARADA DE EMERGENCIA !!!"); // COMENTADO
-      emEmergencia = true;
-      sistemaAtivo = false;
-    }
-    pararTudo(); 
-    lcd.setCursor(0,0); lcd.print("!! EMERGENCIA !!");
-    lcd.setCursor(0,1); lcd.print("SISTEMA TRAVADO ");
-    delay(100);
-    return; 
+  // Status Code (0=Off, 1=Resfria, 2=Aquece, 3=Standby, 4=EMERGENCIA)
+  if (digitalRead(PIN_CHAVE_EMERG) == LOW || emergenciaVirtual) {
+      tab_reg[4] = 4; 
   } else {
-    if (emEmergencia) {
-      lcd.clear();
-      emEmergencia = false;
-    }
+      tab_reg[4] = (uint16_t)(sistemaAtivo ? (ultimoModo == 0 ? 3 : ultimoModo) : 0); 
   }
 
-  // 3. BOTÃO START/PAUSE
+  modbusino_slave.loop(tab_reg, 10);
+
+  // 2. COMANDOS SCADA
+  switch(tab_reg[5]) {
+    case 1: // LIGAR
+      if (digitalRead(PIN_CHAVE_EMERG) == HIGH && !emergenciaVirtual) {
+          sistemaAtivo = true;
+      }
+      tab_reg[5] = 0; 
+      break;
+    case 2: // DESLIGAR
+      sistemaAtivo = false;
+      pararTudo();
+      tab_reg[5] = 0;
+      break;
+    case 3: // ACIONAR EMERGENCIA VIRTUAL
+      emergenciaVirtual = true;
+      tab_reg[5] = 0;
+      break;
+    case 4: // RESETAR EMERGENCIA VIRTUAL
+      emergenciaVirtual = false;
+      tab_reg[5] = 0;
+      break;
+  }
+
+  // 3. EMERGÊNCIA UNIFICADA
+  bool emergenciaFisica = (digitalRead(PIN_CHAVE_EMERG) == LOW);
+  
+  if (emergenciaFisica || emergenciaVirtual) {
+      sistemaAtivo = false; 
+      pararTudo();          
+      
+      lcd.setCursor(0,0); lcd.print("!! EMERGENCIA !!");
+      lcd.setCursor(0,1);
+      if (emergenciaFisica && emergenciaVirtual) lcd.print("TRAVA: FIS + VIRT");
+      else if (emergenciaFisica) lcd.print("TRAVA: FISICA    ");
+      else lcd.print("TRAVA: SCADA     ");
+
+      return; 
+  }
+
+  // 4. BOTÃO START FÍSICO
   int leituraBtn = digitalRead(PIN_BTN_START);
   if (leituraBtn == LOW && ultimoEstadoBtnStart == HIGH && (millis() - lastDebounceTime) > 200) {
     sistemaAtivo = !sistemaAtivo;
     lastDebounceTime = millis();
     lcd.clear();
-    
-    if (!sistemaAtivo) {
-       pararTudo(); 
-       // Serial.println("Status: SISTEMA PAUSADO"); // COMENTADO
-    } else {
-       // Serial.println("Status: SISTEMA INICIADO"); // COMENTADO
-    }
+    if (!sistemaAtivo) pararTudo(); 
   }
   ultimoEstadoBtnStart = leituraBtn;
 
-  // VERIFICAÇÃO DE ERRO CRÍTICO SENSOR
   if (isnan(tempAtual) || isnan(humAtual)) {
     lcd.setCursor(0,0); lcd.print("ERRO SENSOR DHT ");
     pararTudo();
     return;
   }
 
-  // --- LÓGICA SOFT PICKUP (POTENCIÔMETRO) ---
+  // 5. SETPOINT HÍBRIDO
+  float scadaTemp = (float)tab_reg[2] / 10.0;
+  float scadaHum = (float)tab_reg[3] / 10.0;
+
+  // SCADA vence
+  if (abs(scadaTemp - setpointTemp) > 0.1) {
+      setpointTemp = scadaTemp;
+      modoSincronia = true; 
+  }
+  if (abs(scadaHum - setpointHum) > 0.1) {
+      setpointHum = scadaHum; 
+      modoSincronia = true;
+  }
+
+  // Potenciômetro
   int leituraChave = digitalRead(PIN_CHAVE_SELETORA);
   bool ajustandoTemp = (leituraChave == HIGH);
   int valorPot = analogRead(PIN_POT);
@@ -161,28 +185,31 @@ void loop() {
       lcd.clear(); 
   }
 
-  float valorPotMapeado;
-  if (ajustandoTemp) {
-      valorPotMapeado = map(valorPot, 0, 1023, 0, 70); 
-  } else {
-      valorPotMapeado = map(valorPot, 0, 1023, 0, 100);
-  }
+  if (abs(valorPot - ultimaLeituraPot) > limiarMovimento) {
+      ultimaLeituraPot = valorPot; 
+      float valorPotMapeado;
+      if (ajustandoTemp) valorPotMapeado = map(valorPot, 0, 1023, 0, 70); 
+      else valorPotMapeado = map(valorPot, 0, 1023, 0, 100);
 
-  if (modoSincronia) {
-      float valorAlvo = ajustandoTemp ? setpointTemp : setpointHum;
-      if (abs(valorPotMapeado - valorAlvo) < 2.0) {
-          modoSincronia = false; 
-      }
-  } else {
-      if (ajustandoTemp) {
-          setpointTemp = valorPotMapeado;
+      if (modoSincronia) {
+          float valorAlvo = ajustandoTemp ? setpointTemp : setpointHum;
+          if (abs(valorPotMapeado - valorAlvo) < 2.0) modoSincronia = false; 
       } else {
-          setpointHum = valorPotMapeado;
+          if (ajustandoTemp) {
+              setpointTemp = valorPotMapeado;
+              tab_reg[2] = (uint16_t)(setpointTemp * 10); 
+          } else {
+              setpointHum = valorPotMapeado;
+              tab_reg[3] = (uint16_t)(setpointHum * 10); 
+          }
       }
+  } else {
+      // Mantém SCADA sincronizado com a lógica interna
+      tab_reg[2] = (uint16_t)(setpointTemp * 10);
+      tab_reg[3] = (uint16_t)(setpointHum * 10);
   }
-  // --------------------------
 
-  // 4. LÓGICA DE CONTROLE
+  // 6. ATUAÇÃO
   if (sistemaAtivo) {
     controlarTemperatura(tempAtual);
     controlarUmidade(humAtual);
@@ -190,29 +217,20 @@ void loop() {
     pararTudo(); 
   }
 
-  // 5. ATUALIZAÇÃO VISUAL (LCD)
-  atualizarLCD(tempAtual, humAtual, ajustandoTemp, valorPotMapeado);
-  
-  // enviarSerial(tempAtual, humAtual); // COMENTADO: A função inteira foi desativada
+  // Chamada do LCD atualizada
+  atualizarLCD(tempAtual, humAtual, ajustandoTemp);
 }
 
-// --- FUNÇÕES DE CONTROLE ---
+// --- FUNÇÕES AUXILIARES ---
 
 void controlarTemperatura(float temp) {
   unsigned long agora = millis();
-  int acaoDesejada = 0; // 0=Desligado
-  
-  if (temp > (setpointTemp + histereseTemp)) acaoDesejada = 1; // Resfriar
-  else if (temp < (setpointTemp - histereseTemp)) acaoDesejada = 2; // Aquecer
+  int acaoDesejada = 0; 
+  if (temp > (setpointTemp + histereseTemp)) acaoDesejada = 1; 
+  else if (temp < (setpointTemp - histereseTemp)) acaoDesejada = 2; 
 
   if (acaoDesejada == ultimoModo) return;
-
-  // TIMER PROTEÇÃO
-  if (acaoDesejada != 0) {
-    if (agora - ultimoTempoDesligado < tempoSeguranca) {
-      return; 
-    }
-  }
+  if (acaoDesejada != 0 && (agora - ultimoTempoDesligado < tempoSeguranca)) return; 
 
   if (acaoDesejada == 1) { 
     digitalWrite(PIN_RELE_PELTIER_A, RELE_DESLIGADO); 
@@ -230,82 +248,48 @@ void controlarTemperatura(float temp) {
 }
 
 void controlarUmidade(float hum) {
-  if (!sistemaAtivo) {
-      digitalWrite(PIN_RELE_UMIDADE, LOW);
-      return;
-  }
-
-  if (hum > (setpointHum - histereseHum)) {
-    digitalWrite(PIN_RELE_UMIDADE, HIGH); 
-  } 
-  else if (hum < setpointHum) {
-    digitalWrite(PIN_RELE_UMIDADE, LOW); 
-  }
+  if (!sistemaAtivo) { digitalWrite(PIN_RELE_UMIDADE, LOW); return; }
+  if (hum > (setpointHum - histereseHum)) digitalWrite(PIN_RELE_UMIDADE, HIGH); 
+  else if (hum < setpointHum) digitalWrite(PIN_RELE_UMIDADE, LOW); 
 }
 
 void pararTudo() {
   unsigned long agora = millis();
-  
   if (ultimoModo != 0) {
     ultimoTempoDesligado = agora;
     ultimoModo = 0;
   }
-
   digitalWrite(PIN_RELE_PELTIER_A, RELE_DESLIGADO);
   digitalWrite(PIN_RELE_PELTIER_B, RELE_DESLIGADO);
   digitalWrite(PIN_RELE_UMIDADE, LOW); 
 }
 
-// --- VISUALIZAÇÃO ATUALIZADA ---
-
-void atualizarLCD(float t, float h, bool modoTemp, float potFantasma) {
+// --- VISUALIZAÇÃO CORRIGIDA ---
+void atualizarLCD(float t, float h, bool modoTemp) {
   static unsigned long lcdTimer = 0;
   if (millis() - lcdTimer < 250) return; 
   lcdTimer = millis();
 
-  if (modoSincronia) {
-      lcd.setCursor(0, 0);
-      lcd.print(">> TRAVA DE SEGUR <<");
-      lcd.setCursor(0, 1);
-      lcd.print("Gire p/ "); 
-      if(modoTemp) lcd.print(setpointTemp, 0); else lcd.print(setpointHum, 0);
-      
-      lcd.print(" (Pot:"); 
-      lcd.print(potFantasma, 0); 
-      lcd.print(")");
-      return; 
-  }
+  // Removi o bloco "if (modoSincronia) return" que bloqueava a tela
 
+  // LINHA 0: Status e Leituras
   lcd.setCursor(0, 0);
-  if (sistemaAtivo) lcd.print("ON "); else lcd.print("OFF");
-  
-  lcd.print(" T:"); lcd.print(t, 0); lcd.print("C U:"); lcd.print(h, 0); lcd.print("%");
+  if (sistemaAtivo) lcd.print("ON  "); else lcd.print("OFF ");
+  lcd.print("T:"); lcd.print(t, 0); lcd.print(" U:"); lcd.print(h, 0); 
 
+  // LINHA 1: Setpoints e Indicador de Modo
   lcd.setCursor(0, 1);
   
-  long tempoPassado = millis() - ultimoTempoDesligado;
-  long segundosRestantes = (tempoSeguranca - tempoPassado) / 1000;
-  
-  bool precisaAtuar = (t > setpointTemp + histereseTemp) || (t < setpointTemp - histereseTemp);
-  bool bloqueado = (tempoPassado < tempoSeguranca);
+  // Define o caractere indicador:
+  // '>' = Potenciômetro Ativo
+  // '*' = Sincronia Pendente (Valor do SCADA prevalece, Pot travado)
+  char indicador = modoSincronia ? '*' : '>';
 
-  if (sistemaAtivo && bloqueado && precisaAtuar) {
-    lcd.print("AGUARDE PROT: "); 
-    if(segundosRestantes < 10) lcd.print("0");
-    lcd.print(segundosRestantes);
-    lcd.print("s   "); 
-  } 
-  else {
-    if (modoTemp) {
-      lcd.print("SetT:>"); lcd.print(setpointTemp, 0); lcd.print(" SetU: "); lcd.print(setpointHum, 0);
-    } else {
-      lcd.print("SetT: "); lcd.print(setpointTemp, 0); lcd.print(" SetU:>"); lcd.print(setpointHum, 0);
-    }
+  if (modoTemp) {
+     lcd.print("SetT:"); lcd.print(indicador); lcd.print(setpointTemp, 0); 
+     lcd.print(" SetU: "); lcd.print(setpointHum, 0);
+  } else {
+     lcd.print("SetT: "); lcd.print(setpointTemp, 0); 
+     lcd.print(" SetU:"); lcd.print(indicador); lcd.print(setpointHum, 0);
   }
 }
-
-/*
-void enviarSerial(float t, float h) {
-  // FUNÇÃO DESATIVADA PARA NÃO GERAR CONFLITO COM SCADA
-}
-*/
