@@ -1,6 +1,6 @@
 /*
- * PROJETO: Controle Peltier (Quente/Frio) + Umidade
- * VERSAO: Soft Pickup (Correção do Pulo do Potenciômetro)
+ * PROJETO: Controle Peltier (Quente/Frio) + Umidade + SCADA (MODBUS)
+ * VERSAO: Clean Serial (Sem conflito de porta)
  */
 
 #include <Wire.h>
@@ -8,6 +8,7 @@
 #include <DHT.h>
 #include <Modbusino.h>
 
+// ID do escravo Modbus = 1
 ModbusinoSlave modbusino_slave(1);
 
 // --- DEFINIÇÃO DE PINOS ---
@@ -35,7 +36,6 @@ bool sistemaAtivo = false;
 bool emEmergencia = false;
 bool ultimoEstadoBtnStart = HIGH; 
 unsigned long lastDebounceTime = 0;
-unsigned long delaySerial = 0;
 
 // Setpoints
 float setpointTemp = 25.0; 
@@ -50,15 +50,16 @@ unsigned long ultimoTempoDesligado = 0;
 const unsigned long tempoSeguranca = 60000; // 60s
 int ultimoModo = 0; // 0=Desligado, 1=Resfriando, 2=Aquecendo
 
-// --- VARIÁVEIS PARA LOGICA DO POTENCIOMETRO (NOVO) ---
-int ultimoEstadoChave = -1; // Para detectar troca da chave
-bool modoSincronia = false; // Indica se o pot está travado esperando encontro
+// --- VARIÁVEIS PARA LOGICA DO POTENCIOMETRO ---
+int ultimoEstadoChave = -1; 
+bool modoSincronia = false; 
 
+// Tabela Modbus (10 registradores)
 uint16_t tab_reg[10];
 
 void setup() {
+  // Configura a Serial para Modbus (9600 baud)
   modbusino_slave.setup(9600);
-  Serial.begin(9600);
   
   pinMode(PIN_BTN_START, INPUT_PULLUP);
   pinMode(PIN_CHAVE_SELETORA, INPUT_PULLUP);
@@ -83,17 +84,34 @@ void setup() {
   // Inicializa estado da chave
   ultimoEstadoChave = digitalRead(PIN_CHAVE_SELETORA);
 
-  Serial.println("--- INICIANDO SISTEMA ---");
+  // Serial.println("--- INICIANDO SISTEMA ---"); // COMENTADO: CONFLITO MODBUS
 }
 
 void loop() {
-  tab_reg[0] = 10;
-  tab_reg[1] = 10;
+  
+  // 1. LEITURA SENSOR
+  float tempAtual = dht.readTemperature();
+  float humAtual = dht.readHumidity();
+
+  // Se der erro no sensor, zera valores para segurança
+  if (isnan(tempAtual)) tempAtual = 0.0;
+  if (isnan(humAtual)) humAtual = 0.0;
+
+  // --- ATUALIZAÇÃO TABELA MODBUS (SCADA) ---
+  // Multiplicamos por 10 para enviar decimais como inteiro (Ex: 25.5 vira 255)
+  tab_reg[0] = (uint16_t)(tempAtual * 10);      // Temp Real
+  tab_reg[1] = (uint16_t)(humAtual * 10);       // Umid Real
+  tab_reg[2] = (uint16_t)(setpointTemp * 10);   // Setpoint T
+  tab_reg[3] = (uint16_t)(setpointHum * 10);    // Setpoint U
+  tab_reg[4] = (uint16_t)ultimoModo;            // Status (0, 1 ou 2)
+  
+  // Processa requisições do Elipse
   modbusino_slave.loop(tab_reg, 10);
-  // 1. VERIFICA EMERGÊNCIA
+
+  // 2. VERIFICA EMERGÊNCIA
   if (digitalRead(PIN_CHAVE_EMERG) == LOW) { 
     if (!emEmergencia) {
-      Serial.println("!!! PARADA DE EMERGENCIA !!!");
+      // Serial.println("!!! PARADA DE EMERGENCIA !!!"); // COMENTADO
       emEmergencia = true;
       sistemaAtivo = false;
     }
@@ -109,7 +127,7 @@ void loop() {
     }
   }
 
-  // 2. BOTÃO START/PAUSE
+  // 3. BOTÃO START/PAUSE
   int leituraBtn = digitalRead(PIN_BTN_START);
   if (leituraBtn == LOW && ultimoEstadoBtnStart == HIGH && (millis() - lastDebounceTime) > 200) {
     sistemaAtivo = !sistemaAtivo;
@@ -118,36 +136,31 @@ void loop() {
     
     if (!sistemaAtivo) {
        pararTudo(); 
-       Serial.println("Status: SISTEMA PAUSADO PELO USUARIO");
+       // Serial.println("Status: SISTEMA PAUSADO"); // COMENTADO
     } else {
-       Serial.println("Status: SISTEMA INICIADO");
+       // Serial.println("Status: SISTEMA INICIADO"); // COMENTADO
     }
   }
   ultimoEstadoBtnStart = leituraBtn;
 
-  // 3. LEITURA SENSOR E POTENCIÔMETRO (LÓGICA CORRIGIDA)
-  float tempAtual = dht.readTemperature();
-  float humAtual = dht.readHumidity();
-
+  // VERIFICAÇÃO DE ERRO CRÍTICO SENSOR
   if (isnan(tempAtual) || isnan(humAtual)) {
     lcd.setCursor(0,0); lcd.print("ERRO SENSOR DHT ");
     pararTudo();
     return;
   }
 
-  // --- LÓGICA SOFT PICKUP ---
+  // --- LÓGICA SOFT PICKUP (POTENCIÔMETRO) ---
   int leituraChave = digitalRead(PIN_CHAVE_SELETORA);
   bool ajustandoTemp = (leituraChave == HIGH);
   int valorPot = analogRead(PIN_POT);
   
-  // Detecta se o usuário trocou a chave de posição
   if (leituraChave != ultimoEstadoChave) {
-      modoSincronia = true; // Ativa a trava de segurança
+      modoSincronia = true; 
       ultimoEstadoChave = leituraChave;
-      lcd.clear(); // Limpa para mostrar msg de trava
+      lcd.clear(); 
   }
 
-  // Calcula quanto o potenciômetro valeria se estivesse ativo agora
   float valorPotMapeado;
   if (ajustandoTemp) {
       valorPotMapeado = map(valorPot, 0, 1023, 0, 70); 
@@ -155,16 +168,12 @@ void loop() {
       valorPotMapeado = map(valorPot, 0, 1023, 0, 100);
   }
 
-  // Se estiver em modo de sincronia, verifica se o pot "encontrou" o valor salvo
   if (modoSincronia) {
       float valorAlvo = ajustandoTemp ? setpointTemp : setpointHum;
-      // Tolerância de +/- 2 unidades para destravar
       if (abs(valorPotMapeado - valorAlvo) < 2.0) {
-          modoSincronia = false; // Destrava! O pot alcançou o valor.
+          modoSincronia = false; 
       }
-      // Se não encontrou, NÃO atualiza os setpoints (mantém o valor antigo)
   } else {
-      // Se não está travado, atualiza normalmente
       if (ajustandoTemp) {
           setpointTemp = valorPotMapeado;
       } else {
@@ -181,10 +190,10 @@ void loop() {
     pararTudo(); 
   }
 
-  // 5. ATUALIZAÇÃO VISUAL
-  // Passo também o valorPotMapeado para mostrar na tela o "Fantasma" durante a trava
+  // 5. ATUALIZAÇÃO VISUAL (LCD)
   atualizarLCD(tempAtual, humAtual, ajustandoTemp, valorPotMapeado);
-  enviarSerial(tempAtual, humAtual);
+  
+  // enviarSerial(tempAtual, humAtual); // COMENTADO: A função inteira foi desativada
 }
 
 // --- FUNÇÕES DE CONTROLE ---
@@ -198,21 +207,19 @@ void controlarTemperatura(float temp) {
 
   if (acaoDesejada == ultimoModo) return;
 
-  // VERIFICAÇÃO DE SEGURANÇA (TIMER)
+  // TIMER PROTEÇÃO
   if (acaoDesejada != 0) {
     if (agora - ultimoTempoDesligado < tempoSeguranca) {
-      return; // Bloqueado pelo timer
+      return; 
     }
   }
 
   if (acaoDesejada == 1) { 
-    // MODO RESFRIAR
     digitalWrite(PIN_RELE_PELTIER_A, RELE_DESLIGADO); 
     digitalWrite(PIN_RELE_PELTIER_B, RELE_LIGADO);
     ultimoModo = 1;
   }
   else if (acaoDesejada == 2) { 
-    // MODO AQUECER
     digitalWrite(PIN_RELE_PELTIER_A, RELE_LIGADO);
     digitalWrite(PIN_RELE_PELTIER_B, RELE_DESLIGADO);
     ultimoModo = 2;
@@ -253,25 +260,22 @@ void pararTudo() {
 
 void atualizarLCD(float t, float h, bool modoTemp, float potFantasma) {
   static unsigned long lcdTimer = 0;
-  if (millis() - lcdTimer < 250) return; // Atualização um pouco mais rápida
+  if (millis() - lcdTimer < 250) return; 
   lcdTimer = millis();
 
-  // Se estiver em modo sincronia, mostra interface de ajuda
   if (modoSincronia) {
       lcd.setCursor(0, 0);
       lcd.print(">> TRAVA DE SEGUR <<");
       lcd.setCursor(0, 1);
-      // Mostra o valor que você está tentando alcançar e onde o pot está
       lcd.print("Gire p/ "); 
       if(modoTemp) lcd.print(setpointTemp, 0); else lcd.print(setpointHum, 0);
       
       lcd.print(" (Pot:"); 
       lcd.print(potFantasma, 0); 
       lcd.print(")");
-      return; // Sai da função, não mostra o padrão
+      return; 
   }
 
-  // --- INTERFACE PADRÃO ---
   lcd.setCursor(0, 0);
   if (sistemaAtivo) lcd.print("ON "); else lcd.print("OFF");
   
@@ -292,7 +296,6 @@ void atualizarLCD(float t, float h, bool modoTemp, float potFantasma) {
     lcd.print("s   "); 
   } 
   else {
-    // Mostra setas indicando qual está sendo editado
     if (modoTemp) {
       lcd.print("SetT:>"); lcd.print(setpointTemp, 0); lcd.print(" SetU: "); lcd.print(setpointHum, 0);
     } else {
@@ -301,11 +304,8 @@ void atualizarLCD(float t, float h, bool modoTemp, float potFantasma) {
   }
 }
 
+/*
 void enviarSerial(float t, float h) {
-  if (millis() - delaySerial > 1000) {
-    Serial.print("Modo: "); Serial.print(ultimoModo);
-    Serial.print(" | T: "); Serial.print(t, 1);
-    Serial.print(" | U: "); Serial.println(h, 1);
-    delaySerial = millis();
-  }
+  // FUNÇÃO DESATIVADA PARA NÃO GERAR CONFLITO COM SCADA
 }
+*/
