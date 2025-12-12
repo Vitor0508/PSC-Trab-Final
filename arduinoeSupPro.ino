@@ -1,6 +1,6 @@
 /*
  * PROJETO: Controle Peltier Hibrido (SCADA + Fisico)
- * VERSAO: Com Feedback do Rele de Umidade (Reg 6)
+ * VERSAO: Correcao LCD (Decimais, Limpeza de Tela e Timer @)
  */
 
 #include <Wire.h>
@@ -96,37 +96,36 @@ void loop() {
   tab_reg[0] = (uint16_t)(tempAtual * 10);      
   tab_reg[1] = (uint16_t)(humAtual * 10);       
   
-  // Status Code (0=Off, 1=Resfria, 2=Aquece, 3=Standby, 4=EMERGENCIA)
+  // Status Code 
   if (digitalRead(PIN_CHAVE_EMERG) == LOW || emergenciaVirtual) {
       tab_reg[4] = 4; 
   } else {
       tab_reg[4] = (uint16_t)(sistemaAtivo ? (ultimoModo == 0 ? 3 : ultimoModo) : 0); 
   }
 
-  // --- NOVO: STATUS DO RELÉ DE UMIDADE ---
-  // Lê o estado físico do pino 9. Se HIGH retorna 1, se LOW retorna 0.
+  // STATUS RELE UMIDADE
   tab_reg[6] = digitalRead(PIN_RELE_UMIDADE); 
 
   modbusino_slave.loop(tab_reg, 10);
 
   // 2. COMANDOS SCADA
   switch(tab_reg[5]) {
-    case 1: // LIGAR
+    case 1: 
       if (digitalRead(PIN_CHAVE_EMERG) == HIGH && !emergenciaVirtual) {
           sistemaAtivo = true;
       }
       tab_reg[5] = 0; 
       break;
-    case 2: // DESLIGAR
+    case 2: 
       sistemaAtivo = false;
       pararTudo();
       tab_reg[5] = 0;
       break;
-    case 3: // ACIONAR EMERGENCIA VIRTUAL
+    case 3: 
       emergenciaVirtual = true;
       tab_reg[5] = 0;
       break;
-    case 4: // RESETAR EMERGENCIA VIRTUAL
+    case 4: 
       emergenciaVirtual = false;
       tab_reg[5] = 0;
       break;
@@ -139,11 +138,11 @@ void loop() {
       sistemaAtivo = false; 
       pararTudo();          
       
-      lcd.setCursor(0,0); lcd.print("!! EMERGENCIA !!");
+      lcd.setCursor(0,0); lcd.print("!! EMERGENCIA !!    "); // Espaços para limpar linha
       lcd.setCursor(0,1);
-      if (emergenciaFisica && emergenciaVirtual) lcd.print("TRAVA: FIS + VIRT");
-      else if (emergenciaFisica) lcd.print("TRAVA: FISICA    ");
-      else lcd.print("TRAVA: SCADA     ");
+      if (emergenciaFisica && emergenciaVirtual) lcd.print("TRAVA: FIS + VIRT   ");
+      else if (emergenciaFisica) lcd.print("TRAVA: FISICA       ");
+      else lcd.print("TRAVA: SCADA        ");
 
       return; 
   }
@@ -153,13 +152,13 @@ void loop() {
   if (leituraBtn == LOW && ultimoEstadoBtnStart == HIGH && (millis() - lastDebounceTime) > 200) {
     sistemaAtivo = !sistemaAtivo;
     lastDebounceTime = millis();
-    lcd.clear();
+    lcd.clear(); // Aqui ok limpar pois é mudança drástica de estado
     if (!sistemaAtivo) pararTudo(); 
   }
   ultimoEstadoBtnStart = leituraBtn;
 
   if (isnan(tempAtual) || isnan(humAtual)) {
-    lcd.setCursor(0,0); lcd.print("ERRO SENSOR DHT ");
+    lcd.setCursor(0,0); lcd.print("ERRO SENSOR DHT     ");
     pararTudo();
     return;
   }
@@ -168,7 +167,6 @@ void loop() {
   float scadaTemp = (float)tab_reg[2] / 10.0;
   float scadaHum = (float)tab_reg[3] / 10.0;
 
-  // SCADA vence
   if (abs(scadaTemp - setpointTemp) > 0.1) {
       setpointTemp = scadaTemp;
       modoSincronia = true; 
@@ -178,7 +176,6 @@ void loop() {
       modoSincronia = true;
   }
 
-  // Potenciômetro
   int leituraChave = digitalRead(PIN_CHAVE_SELETORA);
   bool ajustandoTemp = (leituraChave == HIGH);
   int valorPot = analogRead(PIN_POT);
@@ -186,7 +183,7 @@ void loop() {
   if (leituraChave != ultimoEstadoChave) {
       modoSincronia = true; 
       ultimoEstadoChave = leituraChave;
-      lcd.clear(); 
+      // Não damos lcd.clear() aqui para evitar piscar, a função atualizarLCD vai limpar
   }
 
   if (abs(valorPot - ultimaLeituraPot) > limiarMovimento) {
@@ -252,12 +249,6 @@ void controlarTemperatura(float temp) {
 void controlarUmidade(float hum) {
   if (!sistemaAtivo) { digitalWrite(PIN_RELE_UMIDADE, LOW); return; }
   
-  // LOGICA: Se Umidade Atual > Setpoint, LIGA o umidificador?
-  // Normalmente, se for UMIDIFICADOR: Se Hum < Setpoint, LIGA.
-  // Se for EXAUSTOR/DESUMIDIFICADOR: Se Hum > Setpoint, LIGA.
-  // Pelo seu código original: hum > (set - hist) -> LIGA (HIGH).
-  // Isso indica um comportamento de DESUMIDIFICAR ou ventilar.
-  
   if (hum > (setpointHum - histereseHum)) digitalWrite(PIN_RELE_UMIDADE, HIGH); 
   else if (hum < setpointHum) digitalWrite(PIN_RELE_UMIDADE, LOW); 
 }
@@ -273,23 +264,41 @@ void pararTudo() {
   digitalWrite(PIN_RELE_UMIDADE, LOW); 
 }
 
+// --- FUNÇÃO DE LCD OTIMIZADA ---
 void atualizarLCD(float t, float h, bool modoTemp) {
   static unsigned long lcdTimer = 0;
-  if (millis() - lcdTimer < 250) return; 
+  if (millis() - lcdTimer < 300) return; // Aumentei um pouco o refresh para estabilizar
   lcdTimer = millis();
 
-  lcd.setCursor(0, 0);
-  if (sistemaAtivo) lcd.print("ON  "); else lcd.print("OFF ");
-  lcd.print("T:"); lcd.print(t, 0); lcd.print(" U:"); lcd.print(h, 0); 
+  // 1. Verifica Proteção de Timer
+  bool emProtecao = (millis() - ultimoTempoDesligado < tempoSeguranca);
 
+  // --- LINHA 0 ---
+  lcd.setCursor(0, 0);
+  if (sistemaAtivo) lcd.print("ON "); else lcd.print("OFF");
+  
+  // Imprime @ se estiver contando tempo de segurança, senão espaço vazio
+  if (emProtecao) lcd.print("@"); else lcd.print(" ");
+
+  // Temperatura com 1 casa decimal + espaço para limpar dígitos antigos
+  lcd.print("T:"); lcd.print(t, 1); lcd.print(" "); 
+  
+  // Umidade com 1 casa decimal + espaço para limpar dígitos antigos
+  lcd.print("U:"); lcd.print(h, 1); lcd.print(" "); 
+
+  // --- LINHA 1 ---
   lcd.setCursor(0, 1);
   char indicador = modoSincronia ? '*' : '>';
 
+  // Aqui usamos strings de tamanho fixo ou espaços no final para apagar o lixo
   if (modoTemp) {
-     lcd.print("SetT:"); lcd.print(indicador); lcd.print(setpointTemp, 0); 
-     lcd.print(" SetU: "); lcd.print(setpointHum, 0);
+     lcd.print("SetT:"); lcd.print(indicador); lcd.print(setpointTemp, 1); lcd.print(" ");
+     lcd.print("SetU: "); lcd.print(setpointHum, 1); lcd.print(" ");
   } else {
-     lcd.print("SetT: "); lcd.print(setpointTemp, 0); 
-     lcd.print(" SetU:"); lcd.print(indicador); lcd.print(setpointHum, 0);
+     lcd.print("SetT: "); lcd.print(setpointTemp, 1); lcd.print(" ");
+     lcd.print("SetU:"); lcd.print(indicador); lcd.print(setpointHum, 1); lcd.print(" ");
   }
+  
+  // Garante limpeza do final da linha caso sobre caracteres
+  lcd.print("  "); 
 }
